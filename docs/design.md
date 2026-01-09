@@ -1073,3 +1073,227 @@ onMounted(async () => {
    - 在 `drug_search` 增加 `/drug/search` API 路由。
    - 在 `symptom_to_plan` 增加调用 DeepSeek Chat，生成用药说明。
    - 在前端 Checkout.vue 展示订单与支付。
+
+## 把后端的内存版`DB`改成Postgres
+把后端的数据库访问层替换成 **SQLAlchemy ORM**，这样更易维护和扩展。下面给你一个完整的实现示例。
+### 1. 安装依赖
+在 `requirements.txt` 中加入：
+```text
+sqlalchemy
+psycopg2-binary
+```
+### 2. 定义 ORM 模型
+在 `backend/domain/models.py`：
+```python
+from sqlalchemy import Column, Integer, String, Boolean, Numeric, Date, ForeignKey, JSON, TIMESTAMP, func
+from sqlalchemy.orm import declarative_base, relationship
+
+Base = declarative_base()
+
+class Drug(Base):
+    __tablename__ = "drugs"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    generic_name = Column(String)
+    spec = Column(String)
+    manufacturer = Column(String)
+    is_rx = Column(Boolean, default=False)
+    contraindications_json = Column(JSON)
+    flags_json = Column(JSON)
+
+class Inventory(Base):
+    __tablename__ = "inventory"
+    id = Column(Integer, primary_key=True)
+    drug_id = Column(Integer, ForeignKey("drugs.id"))
+    stock = Column(Integer, default=0)
+    batch_no = Column(String)
+    expire_date = Column(Date)
+
+class Price(Base):
+    __tablename__ = "prices"
+    id = Column(Integer, primary_key=True)
+    drug_id = Column(Integer, ForeignKey("drugs.id"))
+    list_price = Column(Numeric(10,2))
+    member_tier = Column(String)
+    discount_rate = Column(Numeric(5,2), default=1.0)
+
+class Order(Base):
+    __tablename__ = "orders"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    member_id = Column(Integer)
+    total = Column(Numeric(10,2))
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    items = relationship("OrderItem", back_populates="order")
+
+class OrderItem(Base):
+    __tablename__ = "order_items"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    order_id = Column(Integer, ForeignKey("orders.id"))
+    drug_id = Column(Integer)
+    qty = Column(Integer)
+    unit_price = Column(Numeric(10,2))
+    final_price = Column(Numeric(10,2))
+    order = relationship("Order", back_populates="items")
+```
+### 3. 数据库会话管理
+在 `backend/config.py` 增加 SQLAlchemy 会话：
+```python
+import os
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from pymilvus import connections, Collection
+
+load_dotenv()
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DB_URL = os.getenv("DB_URL")
+MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
+MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
+
+def init_milvus():
+    connections.connect(host=MILVUS_HOST, port=MILVUS_PORT)
+    return Collection("drugs_vectors")  # 需先创建
+
+engine = create_engine(DB_URL, echo=True, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+```
+### 4. 封装数据库操作
+在 `backend/db.py`：
+```python
+from sqlalchemy.orm import Session
+from domain.models import Drug, Inventory, Price, Order, OrderItem
+
+class ORMDB:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get_inventory(self, drug_id):
+        inv = self.session.query(Inventory).filter_by(drug_id=drug_id).first()
+        return {"stock": inv.stock if inv else 0}
+
+    def get_price(self, drug_id, tier):
+        price = self.session.query(Price).filter_by(drug_id=drug_id, member_tier=tier).first()
+        if price:
+            return {"list_price": float(price.list_price), "discount_rate": float(price.discount_rate)}
+        return {"list_price": 0.0, "discount_rate": 1.0}
+
+    def insert_order(self, member_id, items, total):
+        order = Order(member_id=member_id, total=total)
+        self.session.add(order)
+        self.session.flush()  # 获取 order.id
+        for it in items:
+            oi = OrderItem(order_id=order.id,
+                           drug_id=it["drug_id"],
+                           qty=1,
+                           unit_price=it["unit_price"],
+                           final_price=it["final_price"])
+            self.session.add(oi)
+        self.session.commit()
+        return order.id
+
+    def get_latest_order(self, member_id):
+        order = self.session.query(Order).filter_by(member_id=member_id).order_by(Order.created_at.desc()).first()
+        if not order:
+            return None, []
+        items = []
+        for it in order.items:
+            items.append({
+                "drug_id": it.drug_id,
+                "qty": it.qty,
+                "unit_price": float(it.unit_price),
+                "final_price": float(it.final_price),
+                "dose": "按说明书",
+                "notes": "多饮水"
+            })
+        return {"id": order.id, "member_id": member_id, "total": float(order.total)}, items
+```
+### 5. 修改 FastAPI 路由使用 ORM
+在 `backend/app.py`：
+```python
+from fastapi import FastAPI, Depends, Query
+from config import init_milvus, SessionLocal
+from db import ORMDB
+from tools.symptom_to_plan import generate_plan
+from tools.pricing_inventory import enrich_with_price_inventory
+from tools.order_checkout import create_order
+
+app = FastAPI()
+col = init_milvus()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield ORMDB(db)
+    finally:
+        db.close()
+
+@app.post("/symptom/plan")
+def symptom_plan(payload: dict, db: ORMDB = Depends(get_db)):
+    user_ctx = payload.get("user_ctx", {})
+    plan = generate_plan(symptom_text=payload["symptom"], col=col, user_ctx=user_ctx)
+    items = enrich_with_price_inventory(db=db, plan=plan["plan"], member_tier=payload.get("member_tier","basic"))
+    order_id = create_order(db=db, member_id=payload.get("member_id",1), items=items)["order_id"]
+    order, order_items = db.get_latest_order(payload.get("member_id",1))
+    return {"plan": plan, "items": order_items, "order": order}
+
+@app.get("/order/latest")
+def order_latest(member_id: int = Query(...), db: ORMDB = Depends(get_db)):
+    order, items = db.get_latest_order(member_id)
+    if order:
+        return {"order": {"order_id": order["id"], "total": order["total"], "payment_qr": f"/pay/{order['id']}"}, "items": items}
+    return {"order": None, "items": []}
+```
+### 6. 初始化数据库
+在启动时执行：
+```bash
+python -m backend.domain.models
+```
+或者在 `init.sql` 中确保表已创建，然后用 `init_data.sql` 插入测试数据。
+
+这样，你的后端就完全替换成了 **SQLAlchemy ORM** 实现，支持更复杂的查询和关系映射。  
+### 测试数据构造
+在数据库里插入几条药品、库存和价格数据，方便测试整个流程。  
+#### **infra/db/init_data.sql**
+```sql
+-- 插入药品基础信息
+INSERT INTO drugs (id, name, generic_name, spec, manufacturer, is_rx, contraindications_json, flags_json)
+VALUES
+(1, '布洛芬片', 'Ibuprofen', '0.2g*24片', '某制药厂', FALSE, '["pregnancy"]', '["fever_high"]'),
+(2, '阿莫西林胶囊', 'Amoxicillin', '0.25g*20粒', '某制药厂', TRUE, '[]', '[]'),
+(3, '氯雷他定片', 'Loratadine', '10mg*10片', '某制药厂', FALSE, '[]', '[]');
+
+-- 插入库存信息
+INSERT INTO inventory (drug_id, stock, batch_no, expire_date)
+VALUES
+(1, 200, 'B20250101', '2026-12-31'),
+(2, 150, 'A20250102', '2026-06-30'),
+(3, 300, 'C20250103', '2027-01-31');
+
+-- 插入价格信息（不同会员等级）
+INSERT INTO prices (drug_id, list_price, member_tier, discount_rate)
+VALUES
+(1, 19.90, 'basic', 1.0),
+(1, 19.90, 'gold', 0.9),
+(2, 29.90, 'basic', 1.0),
+(2, 29.90, 'gold', 0.85),
+(3, 15.00, 'basic', 1.0),
+(3, 15.00, 'gold', 0.95);
+```
+#### **说明**
+- 插入了三种常见药品：布洛芬、阿莫西林、氯雷他定。
+- 每个药品都有库存信息（数量、批号、有效期）。
+- 价格表里区分了 **basic** 和 **gold** 会员等级，分别设置了不同折扣率。
+#### **使用方法**
+1. 将 `init_data.sql` 放到 `infra/db/` 目录下。
+2. 在 `docker-compose.yml` 中挂载到 Postgres 初始化目录：
+   ```yaml
+   volumes:
+     - ./infra/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+     - ./infra/db/init_data.sql:/docker-entrypoint-initdb.d/init_data.sql
+   ```
+3. 启动容器时，Postgres 会自动执行这两个脚本，建表并插入数据。
+
+这样，你在前端调用 `/symptom/plan` 或 `/order/latest` 时，就能看到真实的药品、库存和价格数据了。  
+
+
+## 

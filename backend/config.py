@@ -1,5 +1,7 @@
 import os
 from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 from pymilvus import connections, Collection
 
 load_dotenv()
@@ -11,3 +13,6 @@ MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
 def init_milvus():
     connections.connect(host=MILVUS_HOST, port=MILVUS_PORT)
     return Collection("drugs_vectors")  # 需先创建
+
+engine = create_engine(DB_URL, echo=True, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
