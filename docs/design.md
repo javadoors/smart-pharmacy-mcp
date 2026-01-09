@@ -2780,4 +2780,90 @@ spec:
 
 这样，你就有了一个完整的 **Helm Chart**，可以通过修改 `values.yaml` 来调整镜像、端口、数据库配置和 Ingress。  
 
+## 手工输入折扣
+来扩展折扣处理方案，支持 **手工输入折扣** 的场景。这样既能覆盖会员等级自动折扣，又能满足店员或药师在特殊情况下手动调整价格的需求。
+### 设计思路
+1. **自动折扣**  
+   - 根据会员等级（如 basic/gold）查询数据库中的折扣率。  
+   - 默认走这一条逻辑。
+2. **手工输入折扣**  
+   - 在调用 `enrich_with_price_inventory` 时，允许传入一个 `manual_discount` 参数。  
+   - 如果存在该参数，则优先使用手工折扣覆盖数据库折扣。  
+   - 手工折扣可以是百分比（如 0.8 表示打八折）或直接金额减免。
+3. **审计与合规**  
+   - 手工折扣必须记录在订单日志中，注明操作人和原因。  
+   - 避免滥用，确保可追溯。
+### 示例代码
+#### tools/pricing_inventory.py
+```python
+def enrich_with_price_inventory(db, plan, member_tier: str, manual_discount: float | None = None):
+    """
+    根据用药计划查询库存和价格，支持会员折扣和手工折扣。
+
+    参数:
+        db: 数据库适配器
+        plan: 用药计划 {"items": [...]}
+        member_tier: 会员等级
+        manual_discount: 手工折扣率 (如 0.8 表示打八折)，默认 None
+
+    返回:
+        items: 带库存和价格的药品列表
+    """
+    items = []
+    for it in plan["items"]:
+        inv = db.get_inventory(it["drug_id"])
+        price = db.get_price(it["drug_id"], member_tier)
+
+        # 优先使用手工折扣
+        discount_rate = manual_discount if manual_discount is not None else price.get("discount_rate", 1.0)
+
+        items.append({
+            **it,
+            "stock": inv["stock"],
+            "unit_price": price["list_price"],
+            "discount_rate": discount_rate,
+            "final_price": price["list_price"] * discount_rate
+        })
+    return items
+```
+#### tools/order_checkout.py
+```python
+def create_order(db, member_id: int, items: list, operator: str = "system", reason: str = ""):
+    """
+    生成订单，支持记录手工折扣操作。
+
+    参数:
+        db: 数据库适配器
+        member_id: 用户 ID
+        items: 药品列表
+        operator: 操作人 (如店员/药师)
+        reason: 手工折扣原因
+
+    返回:
+        dict: 订单信息
+    """
+    total = sum(i["final_price"] for i in items)
+    order_id = db.insert_order(member_id, items, total)
+
+    # 记录审计日志
+    db.insert_audit_log({
+        "order_id": order_id,
+        "operator": operator,
+        "reason": reason,
+        "action": "manual_discount" if any(i["discount_rate"] != 1.0 for i in items) else "auto_discount"
+    })
+
+    return {
+        "order_id": order_id,
+        "total": round(total, 2),
+        "payment_qr": f"/pay?order_id={order_id}&amount={round(total,2)}"
+    }
+```
+### 使用场景
+- **普通会员**：自动折扣，走数据库配置。  
+- **VIP 特殊优惠**：店员输入 `manual_discount=0.7`，直接打七折。  
+- **促销活动**：药师输入 `manual_discount=0.5`，并在 `reason` 中注明“春节促销”。  
+
+这样，折扣处理方案就同时支持 **自动折扣** 和 **手工输入折扣**，并且保证了 **合规可追溯**。  
+
 ## 
