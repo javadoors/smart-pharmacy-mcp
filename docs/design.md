@@ -2024,4 +2024,149 @@ echo "后端 API 地址: http://localhost:8000"
 
 这样，你只需要运行一次 `./bootstrap.sh`，就能完成环境准备并启动整个系统。  
 
+## seed.py作用
+`seed.py` 的作用就是 **把药品基础数据导入到 Milvus 向量数据库**，方便你在系统启动后立即有可检索的药品信息。它相当于一个“数据播种器”，把 CSV 文件里的药品条目转化为向量并写入集合。
+### 工作流程
+1. **读取种子文件**  
+   - 从 `seeds/drugs.csv` 读取药品清单（包含药品 ID、名称、适应症、禁忌、是否处方药、说明等）。
+2. **调用大模型生成向量**  
+   - 使用 DeepSeek Embedding API 将药品文本信息（名称 + 适应症 + 禁忌 + 描述）转化为向量。
+3. **写入 Milvus 集合**  
+   - 将药品 ID、名称、向量和元数据（JSON）插入到 `drugs_vectors` 集合中。
+4. **完成初始化**  
+   - 这样系统启动后，药品检索工具就能立即通过 Milvus 做语义搜索，返回候选药品。
+### 代码片段（简化版）
+```python
+import csv, json
+from pymilvus import connections, Collection
+from tools.drug_search import upsert_drug
+
+# 连接 Milvus
+connections.connect(host="milvus", port="19530")
+col = Collection("drugs_vectors")
+
+# 读取 CSV 并插入
+with open("seeds/drugs.csv", encoding="utf-8") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        drug = {
+            "id": int(row["id"]),
+            "name": row["name"],
+            "indications": row.get("indications",""),
+            "contraindications": json.loads(row.get("contraindications","[]")),
+            "flags": json.loads(row.get("flags","[]")),
+            "is_rx": row.get("is_rx","false").lower()=="true",
+            "desc": row.get("desc","")
+        }
+        upsert_drug(col, drug)
+
+print("Seeded drugs into Milvus.")
+```
+### 总结
+- **seed.py** = 初始化脚本  
+- **作用**：把药品数据“播种”到 Milvus，保证检索功能可用。  
+- **依赖**：`drugs.csv` 数据文件、DeepSeek Embedding API、Milvus 集合。  
+
+这样你就不用手动逐条插入药品，系统一启动就能检索到药品信息。  
+### **drugs.csv 示例**
+```csv
+id,name,indications,contraindications,is_rx,flags,desc
+1,布洛芬片,"用于缓解轻中度疼痛，如头痛、牙痛、肌肉痛、关节痛，以及用于退热","[\"pregnancy\"]",false,"[\"fever_high\"]","常见的非处方解热镇痛药，注意胃肠道不良反应"
+2,阿莫西林胶囊,"用于敏感菌所致的呼吸道感染、泌尿道感染、皮肤软组织感染","[]",true,"[]","常见的处方抗生素，需遵医嘱使用"
+3,氯雷他定片,"用于缓解过敏性鼻炎、荨麻疹等过敏性疾病的症状","[]",false,"[]","第二代抗组胺药，嗜睡作用较轻"
+4,对乙酰氨基酚片,"用于退热和缓解轻中度疼痛，如感冒发热、头痛、牙痛","[\"liver_disease\"]",false,"[]","常见的非处方解热镇痛药，注意肝毒性风险"
+5,奥美拉唑肠溶胶囊,"用于治疗胃溃疡、十二指肠溃疡、反流性食管炎等","[]",true,"[]","处方质子泵抑制剂，需遵医嘱使用"
+```
+**字段说明**
+- **id**：药品唯一编号  
+- **name**：药品名称  
+- **indications**：适应症（简要描述）  
+- **contraindications**：禁忌（JSON 数组格式，便于规则引擎解析）  
+- **is_rx**：是否处方药（true/false）  
+- **flags**：红旗标识（JSON 数组格式，如高热、特殊人群等）  
+- **desc**：药品简要说明  
+#### **使用方法**
+1. 将该文件保存为 `backend/seeds/drugs.csv`。  
+2. 执行：
+   ```bash
+   docker exec -it pharmacy-api python /app/seeds/seed.py
+   ```
+3. 脚本会自动读取 `drugs.csv`，调用 DeepSeek Embedding API 生成向量，并写入 Milvus。  
+
+这样，你就有一个可直接测试的药品数据集，支持检索、规则过滤和症状解析。  
+
+## 重构版seed.py
+来重构 `seed.py`，让它只需要提供一个 **药品名称清单**，然后调用大模型（DeepSeek Chat）自动生成药品基础信息（适应症、禁忌、是否处方药、红旗标识、说明等），再写入 Milvus。这样你就不用手工维护 CSV 的详细字段，只要列出药品名称即可。
+### **重构版 seed.py**
+```python
+"""
+seed.py
+重构为：仅提供药品名称清单，调用大模型获取药品数据并写入 Milvus。
+"""
+
+import json
+from pymilvus import connections, Collection
+from llm.deepseek import embed_text, chat
+from tools.drug_search import upsert_drug
+
+# 连接 Milvus
+connections.connect(host="milvus", port="19530")
+col = Collection("drugs_vectors")
+
+# 药品名称清单（只需维护这个列表）
+drug_names = [
+    "布洛芬片",
+    "阿莫西林胶囊",
+    "氯雷他定片",
+    "对乙酰氨基酚片",
+    "奥美拉唑肠溶胶囊"
+]
+
+# 提示词模板
+SYSTEM_PROMPT = (
+    "你是药师助手。请为给定药品生成结构化的基础信息，"
+    "包括：适应症(indications)、禁忌(contraindications)、是否处方药(is_rx)、红旗标识(flags)、简要说明(desc)。"
+    "输出 JSON 格式，字段为：id, name, indications, contraindications, is_rx, flags, desc。"
+)
+
+def generate_drug_info(name: str, idx: int) -> dict:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"药品名称：{name}"}
+    ]
+    content = chat(messages)
+    try:
+        drug = json.loads(content)
+    except Exception:
+        # 如果模型未返回 JSON，构造一个基础对象
+        drug = {
+            "id": idx,
+            "name": name,
+            "indications": "",
+            "contraindications": [],
+            "is_rx": False,
+            "flags": [],
+            "desc": "模型未返回完整信息，请人工补充"
+        }
+    return drug
+
+def main():
+    for idx, name in enumerate(drug_names, start=1):
+        drug = generate_drug_info(name, idx)
+        upsert_drug(col, drug)
+        print(f"已写入: {drug['name']}")
+
+if __name__ == "__main__":
+    main()
+```
+### **说明**
+- **输入**：只维护 `drug_names` 列表。
+- **调用**：使用 DeepSeek Chat API，根据药品名称生成结构化 JSON。
+- **输出**：写入 Milvus 集合，包含药品 ID、名称、向量和元数据。
+- **容错**：如果模型未返回 JSON，生成一个占位对象，避免流程中断。
+### **好处**
+- 药品数据维护成本大幅降低，只需维护名称。
+- 大模型自动补充药品信息，保证语义检索和规则引擎可用。
+- 可扩展：只需在 `drug_names` 列表中添加新药品名称即可。
+
 ## 
