@@ -91,14 +91,14 @@ flowchart TD
     end
 
     subgraph Backend["后端:FastAPI+LangChain"]
-        B1[药品检索工具\n\(Milvus + Embedding\)]
-        B2[规则引擎工具\n(禁忌\/处方\/红旗)]
+        B1[药品检索工具\n(Milvus + Embedding)]
+        B2[规则引擎工具\n(禁忌/处方/红旗)]
         B3[症状解析工具\n\(Chat 推理链路\)]
-        B4[订单与支付\n库存\/价格\/折扣\/二维码]
-        B5[模拟支付接口 \/pay]
+        B4[订单与支付\n库存/价格/折扣/二维码]
+        B5[模拟支付接口/pay]
     end
 
-    subgraph DB["数据库 \(Postgres\)"]
+    subgraph DB["数据库(Postgres)"]
         C1[药品表]
         C2[库存表]
         C3[价格表]
@@ -106,11 +106,11 @@ flowchart TD
         C5[审计日志]
     end
 
-    subgraph VectorDB["向量库\(Milvus\)"]
+    subgraph VectorDB["向量库(Milvus)"]
         D1[药品向量集合]
     end
 
-    subgraph LLM["大模型\(DeepSeek\)"]
+    subgraph LLM["大模型(DeepSeek)"]
         E1[Embedding API]
         E2[Chat API]
     end
@@ -203,20 +203,19 @@ flowchart TD
 ## 数据流架构图
 ```mermaid
 flowchart TD
+    U[用户输入症状] --> FE[前端Vue3 Symptom页面]
 
-    U[用户输入症状] --> FE[前端 Vue3 Symptom 页面]
-
-    FE --> API[后端 FastAPI /symptom/plan]
+    FE --> API[后端 FastAPI/symptom/plan]
 
     subgraph Backend["后端服务链路"]
-        API --> DS[药品检索工具\n(Milvus + Embedding)]
+        API --> DS[药品检索工具\n(Milvus+Embedding)]
         DS --> RE[规则引擎工具\n禁忌/处方/红旗]
-        RE --> CHAT[症状解析工具\nDeepSeek Chat 推理]
+        RE --> CHAT[症状解析工具\nDeepSeek Chat推理]
         CHAT --> PLAN[生成用药清单(JSON)]
         PLAN --> PI[库存与价格查询\nSQLAlchemy ORM]
         PI --> ORD[订单生成\n计算应付款金额]
         ORD --> PAY[支付二维码链接]
-        PAY --> SIM[模拟支付接口 /pay]
+        PAY --> SIM[模拟支付接口/pay]
     end
 
     subgraph DB["Postgres 数据库"]
@@ -226,7 +225,7 @@ flowchart TD
         Backend --> AUD[审计日志]
     end
 
-    subgraph VectorDB["Milvus 向量库"]
+    subgraph VectorDB["Milvus向量库"]
         DS --> VEC[药品向量集合]
     end
 
