@@ -1943,4 +1943,85 @@ down:
 - 已接通 **Embedding**（Milvus 入库与检索）与 **Chat**（症状→用药清单 JSON）。
 - Chat 返回非 JSON 时有回退策略，保证链路可用；正式环境建议加严格 JSON 模式与重试。
 
+## **bootstrap.sh** 脚本
+把 `.env`、`docker-compose`、`Makefile` 的初始化动作封装起来，方便一键完成环境准备。
+### **bootstrap.sh**
+```bash
+#!/usr/bin/env bash
+set -e
+
+ACTION="init"
+
+# 参数解析
+for arg in "$@"; do
+  case $arg in
+    --reset)
+      ACTION="reset"
+      shift
+      ;;
+    *)
+      ;;
+  esac
+done
+
+echo "=== 智能售药平台脚本执行: $ACTION ==="
+
+# 1. 检查 .env 文件
+if [ ! -f infra/.env ]; then
+  echo "未检测到 infra/.env，复制示例文件..."
+  cp infra/.env.example infra/.env
+  echo "请编辑 infra/.env 填入 DEEPSEEK_API_KEY 等配置。"
+else
+  echo "已检测到 infra/.env。"
+fi
+
+if [ "$ACTION" = "reset" ]; then
+  echo "执行环境重置..."
+  docker compose -f infra/docker-compose.yml down -v
+  echo "已清理容器与数据卷。"
+fi
+
+# 2. 启动 docker-compose
+echo "启动 docker-compose 服务..."
+docker compose -f infra/docker-compose.yml up -d
+
+# 3. 初始化 Milvus 集合
+echo "初始化 Milvus 集合..."
+docker exec -it milvus python /workspace/infra/milvus/init_collection.py || true
+
+# 4. 导入种子数据到 Milvus
+echo "导入种子数据到 Milvus..."
+docker exec -it pharmacy-api python /app/seeds/seed.py || true
+
+echo "=== 完成: $ACTION ==="
+echo "前端访问地址: http://localhost:5173"
+echo "后端 API 地址: http://localhost:8000"
+```
+### **使用方法**
+1. 确保你已经安装了 **Docker** 和 **docker-compose**。
+2. 将 `bootstrap.sh` 放在仓库根目录，并赋予执行权限：
+   ```bash
+   chmod +x bootstrap.sh
+   ```
+3. 执行脚本：
+- **正常初始化**：
+  ```bash
+  ./bootstrap.sh
+  ```
+- **重置环境并重新初始化**：
+  ```bash
+  ./bootstrap.sh --reset
+  ```
+4. 脚本会自动：
+   - 检查并复制 `.env.example` → `.env`
+   - 启动 `docker-compose`
+   - 初始化 Milvus 集合
+   - 导入药品种子数据
+### **说明**
+- `--reset` 会执行 `docker compose down -v`，清理容器和数据卷，相当于彻底清空数据库和 Milvus。
+- 然后重新启动容器，执行 Milvus 集合初始化和种子数据导入。
+- 默认执行 `init`，只启动和初始化，不清理已有数据。
+
+这样，你只需要运行一次 `./bootstrap.sh`，就能完成环境准备并启动整个系统。  
+
 ## 
