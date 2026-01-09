@@ -1295,5 +1295,652 @@ VALUES
 
 这样，你在前端调用 `/symptom/plan` 或 `/order/latest` 时，就能看到真实的药品、库存和价格数据了。  
 
+## DeepSeek Embedding+Chat、SQLAlchemy、Milvus、Vue3路由
+下面是一套可直接初始化的仓库模板，已接通 DeepSeek Embedding 与 Chat 推理链路，后端用 FastAPI + SQLAlchemy + Milvus，前端 Vue3 路由拆分（Search/Symptom/Checkout）。你可以一键 `docker compose up -d` 启动，随后用种子数据完成药品入库与向量检索，并通过症状生成用药清单与订单。
+### 仓库结构
+```text
+smart-pharmacy/
+├─ backend/
+│  ├─ app.py
+│  ├─ config.py
+│  ├─ llm/
+│  │  ├─ deepseek.py
+│  │  └─ prompts.py
+│  ├─ domain/
+│  │  ├─ models.py
+│  │  └─ schemas.py
+│  ├─ tools/
+│  │  ├─ drug_search.py
+│  │  ├─ rule_engine.py
+│  │  ├─ symptom_to_plan.py
+│  │  ├─ pricing_inventory.py
+│  │  └─ order_checkout.py
+│  ├─ seeds/
+│  │  ├─ drugs.csv
+│  │  └─ seed.py
+│  ├─ requirements.txt
+│  └─ Dockerfile
+├─ frontend/
+│  ├─ src/
+│  │  ├─ main.ts
+│  │  ├─ router.ts
+│  │  ├─ App.vue
+│  │  ├─ pages/
+│  │  │  ├─ Search.vue
+│  │  │  ├─ Symptom.vue
+│  │  │  └─ Checkout.vue
+│  │  └─ components/
+│  │     ├─ DrugCard.vue
+│  │     ├─ RuleBadge.vue
+│  │     └─ ExplainPanel.vue
+│  ├─ package.json
+│  └─ Dockerfile
+├─ infra/
+│  ├─ docker-compose.yml
+│  ├─ milvus/init_collection.py
+│  ├─ db/init.sql
+│  ├─ db/init_data.sql
+│  └─ .env.example
+├─ Makefile
+└─ README.md
+```
+### 后端关键实现
+#### requirements.txt
+```text
+fastapi
+uvicorn
+langchain
+pymilvus
+sqlalchemy
+psycopg2-binary
+pydantic
+python-dotenv
+requests
+```
+#### config.py（数据库与 Milvus 会话）
+```python
+import os
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from pymilvus import connections, Collection
+
+load_dotenv()
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DB_URL = os.getenv("DB_URL")
+MILVUS_HOST = os.getenv("MILVUS_HOST", "milvus")
+MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
+
+engine = create_engine(DB_URL, echo=False, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+def init_milvus():
+    connections.connect(host=MILVUS_HOST, port=MILVUS_PORT)
+    return Collection("drugs_vectors")
+```
+#### llm/deepseek.py（Embedding + Chat）
+```python
+import os, requests
+from typing import List, Dict
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
+def _headers():
+    return {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+
+def embed_text(text: str) -> List[float]:
+    url = f"{BASE_URL}/v1/embeddings"
+    payload = {"model": "deepseek-embedding", "input": text}
+    resp = requests.post(url, headers=_headers(), json=payload, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["data"][0]["embedding"]
+
+def chat(messages: List[Dict], stream: bool=False) -> str:
+    url = f"{BASE_URL}/chat/completions"
+    payload = {"model": "deepseek-chat", "messages": messages, "stream": stream}
+    resp = requests.post(url, headers=_headers(), json=payload, timeout=60)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+```
+#### llm/prompts.py（提示词模板）
+```python
+SYSTEM_PLAN = (
+    "你是药师助手。根据症状与候选药品，生成安全、清晰的用药清单。"
+    "必须标注用法用量、注意事项、何时就医；若风险较高，建议线下就医。"
+)
+
+def plan_prompt(symptom: str, candidates: list, user_ctx: dict) -> list:
+    user = {
+        "role": "user",
+        "content": (
+            f"症状：{symptom}\n"
+            f"候选药品（已通过规则过滤）：{candidates}\n"
+            f"用户上下文：{user_ctx}\n"
+            "请给出用药清单（JSON，字段：drug_id、dose、notes），并附简要说明。"
+        )
+    }
+    return [{"role": "system", "content": SYSTEM_PLAN}, user]
+```
+#### domain/models.py（SQLAlchemy ORM）
+```python
+from sqlalchemy import Column, Integer, String, Boolean, Numeric, Date, ForeignKey, JSON, TIMESTAMP, func
+from sqlalchemy.orm import declarative_base, relationship
+
+Base = declarative_base()
+
+class Drug(Base):
+    __tablename__ = "drugs"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    generic_name = Column(String)
+    spec = Column(String)
+    manufacturer = Column(String)
+    is_rx = Column(Boolean, default=False)
+    contraindications_json = Column(JSON)
+    flags_json = Column(JSON)
+
+class Inventory(Base):
+    __tablename__ = "inventory"
+    id = Column(Integer, primary_key=True)
+    drug_id = Column(Integer, ForeignKey("drugs.id"))
+    stock = Column(Integer, default=0)
+    batch_no = Column(String)
+    expire_date = Column(Date)
+
+class Price(Base):
+    __tablename__ = "prices"
+    id = Column(Integer, primary_key=True)
+    drug_id = Column(Integer, ForeignKey("drugs.id"))
+    list_price = Column(Numeric(10,2))
+    member_tier = Column(String)
+    discount_rate = Column(Numeric(5,2), default=1.0)
+
+class Order(Base):
+    __tablename__ = "orders"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    member_id = Column(Integer)
+    total = Column(Numeric(10,2))
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    items = relationship("OrderItem", back_populates="order")
+
+class OrderItem(Base):
+    __tablename__ = "order_items"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    order_id = Column(Integer, ForeignKey("orders.id"))
+    drug_id = Column(Integer)
+    qty = Column(Integer)
+    unit_price = Column(Numeric(10,2))
+    final_price = Column(Numeric(10,2))
+    order = relationship("Order", back_populates="items")
+```
+#### domain/schemas.py（Pydantic）
+```python
+from pydantic import BaseModel
+from typing import List
+
+class UserCtx(BaseModel):
+    age: int | None = None
+    pregnant: bool | None = None
+    prescription_uploaded: bool | None = None
+    fever_celsius: float | None = None
+
+class PlanItem(BaseModel):
+    drug_id: int
+    dose: str
+    notes: str
+
+class Plan(BaseModel):
+    items: List[PlanItem]
+```
+#### tools/drug_search.py（Milvus 入库与检索，使用真实 Embedding）
+```python
+from typing import List, Dict
+from pymilvus import Collection
+from llm.deepseek import embed_text
+
+def upsert_drug(col: Collection, drug: Dict):
+    vec = embed_text(
+        f"{drug['name']} {drug.get('indications','')} {drug.get('contraindications','')} {drug.get('desc','')}"
+    )
+    col.insert([[drug["id"]], [drug["name"]], [vec], [drug]])
+
+def search_drugs(col: Collection, query: str, top_k: int = 10) -> List[Dict]:
+    qvec = embed_text(query)
+    res = col.search([qvec], "embedding", params={"metric_type":"COSINE"}, limit=top_k,
+                     output_fields=["drug_id","name","metadata"])
+    out = []
+    for hits in res:
+        for r in hits:
+            out.append({
+                "drug_id": r.id,
+                "name": r.entity.get("name"),
+                "meta": r.entity.get("metadata")
+            })
+    return out
+```
+#### tools/rule_engine.py（规则决策）
+```python
+from typing import Dict
+
+def evaluate_rules(drug: dict, user_ctx: dict) -> dict:
+    reasons, decision = [], "allow"
+    if drug.get("is_rx") and not user_ctx.get("prescription_uploaded"):
+        decision = "require_pharmacist_review"
+        reasons.append("处方药需药师复核或上传处方")
+    contraindications = drug.get("contraindications", [])
+    if "pregnancy" in contraindications and user_ctx.get("pregnant"):
+        decision = "block"
+        reasons.append("妊娠禁用")
+    flags = drug.get("flags", [])
+    if "fever_high" in flags and (user_ctx.get("fever_celsius") or 0) >= 39:
+        decision = "require_pharmacist_review"
+        reasons.append("高热红旗，建议线下就医")
+    return {"decision": decision, "reasons": reasons}
+```
+#### tools/symptom_to_plan.py（Chat 推理链路）
+```python
+import json
+from typing import Dict
+from .drug_search import search_drugs
+from .rule_engine import evaluate_rules
+from llm.deepseek import chat
+from llm.prompts import plan_prompt
+
+def generate_plan(symptom_text: str, col, user_ctx: Dict) -> Dict:
+    # 1) 候选集合
+    candidates = search_drugs(col, symptom_text, top_k=20)
+    minimal = []
+    for c in candidates:
+        r = evaluate_rules(c["meta"], user_ctx)
+        if r["decision"] == "allow":
+            minimal.append({"drug_id": c["drug_id"], "name": c["name"], "meta": c["meta"]})
+
+    # 2) Chat 生成用药清单（JSON）
+    messages = plan_prompt(symptom_text, [{"drug_id": d["drug_id"], "name": d["name"]} for d in minimal], user_ctx)
+    content = chat(messages)
+    try:
+        parsed = json.loads(content)
+        items = parsed.get("items", [])
+    except Exception:
+        # 回退策略：若模型未返回 JSON，使用最小集构造基础清单
+        items = [{"drug_id": d["drug_id"], "dose": "按说明书", "notes": "多饮水"} for d in minimal]
+
+    return {"plan": {"items": items}, "explain": "模型建议需药师复核"}
+```
+#### tools/pricing_inventory.py
+```python
+"""
+pricing_inventory.py
+负责根据用药计划查询库存和价格，并计算最终价格。
+"""
+from typing import Dict, List
+
+def enrich_with_price_inventory(db, plan: Dict, member_tier: str) -> List[Dict]:
+    """
+    根据用药计划，查询库存和价格，生成带价格信息的药品列表。
+    参数:
+        db: 数据库适配器，需实现 get_inventory(drug_id) 和 get_price(drug_id, tier)
+        plan: 用药计划，格式 {"items": [{"drug_id": int, "dose": str, "notes": str}, ...]}
+        member_tier: 会员等级，例如 "basic", "gold"
+    返回:
+        items: 列表，每个元素包含药品信息、库存、价格、折扣和最终价格
+    """
+    items = []
+    for it in plan["items"]:
+        inv = db.get_inventory(it["drug_id"])
+        price = db.get_price(it["drug_id"], member_tier)
+
+        items.append({
+            **it,
+            "stock": inv["stock"],
+            "unit_price": price["list_price"],
+            "discount_rate": price.get("discount_rate", 1.0),
+            "final_price": price["list_price"] * price.get("discount_rate", 1.0)
+        })
+    return items
+```
+#### tools/order_checkout.py
+```python
+"""
+order_checkout.py
+负责生成订单并返回订单信息。
+"""
+from typing import List, Dict
+
+def create_order(db, member_id: int, items: List[Dict]) -> Dict:
+    """
+    根据药品列表生成订单。
+    参数:
+        db: 数据库适配器，需实现 insert_order(member_id, items, total)
+        member_id: 用户 ID
+        items: 药品列表，每个元素包含 drug_id, final_price 等信息
+    返回:
+        dict: 包含订单号、总金额和支付二维码链接
+    """
+    total = sum(i["final_price"] for i in items)
+    order_id = db.insert_order(member_id, items, total)
+
+    return {
+        "order_id": order_id,
+        "total": total,
+        "payment_qr": f"/pay/{order_id}"
+    }
+```
+#### app.py（FastAPI 路由）
+```python
+from fastapi import FastAPI, Depends, Query
+from config import init_milvus, SessionLocal
+from sqlalchemy.orm import Session
+from domain.models import Base
+from tools.symptom_to_plan import generate_plan
+from tools.pricing_inventory import enrich_with_price_inventory
+from tools.order_checkout import create_order
+from domain.models import Order, OrderItem, Inventory, Price
+
+app = FastAPI()
+col = init_milvus()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ORM 封装（简化）
+class ORMDB:
+    def __init__(self, session: Session):
+        self.s = session
+    def get_inventory(self, drug_id):
+        inv = self.s.query(Inventory).filter_by(drug_id=drug_id).first()
+        return {"stock": inv.stock if inv else 0}
+    def get_price(self, drug_id, tier):
+        p = self.s.query(Price).filter_by(drug_id=drug_id, member_tier=tier).first()
+        return {"list_price": float(p.list_price), "discount_rate": float(p.discount_rate)} if p else {"list_price": 0.0, "discount_rate": 1.0}
+    def insert_order(self, member_id, items, total):
+        order = Order(member_id=member_id, total=total)
+        self.s.add(order); self.s.flush()
+        for it in items:
+            self.s.add(OrderItem(order_id=order.id, drug_id=it["drug_id"], qty=1, unit_price=it["unit_price"], final_price=it["final_price"]))
+        self.s.commit()
+        return order.id
+    def get_latest_order(self, member_id):
+        order = self.s.query(Order).filter_by(member_id=member_id).order_by(Order.created_at.desc()).first()
+        if not order: return None, []
+        items = [{"drug_id": it.drug_id, "qty": it.qty, "unit_price": float(it.unit_price), "final_price": float(it.final_price), "dose": "按说明书", "notes": "多饮水"} for it in order.items]
+        return {"id": order.id, "member_id": member_id, "total": float(order.total)}, items
+
+@app.post("/drug/search")
+def drug_search(payload: dict):
+    from tools.drug_search import search_drugs
+    return search_drugs(col, payload.get("query",""), top_k=10)
+
+@app.post("/symptom/plan")
+def symptom_plan(payload: dict, db: Session = Depends(get_db)):
+    orm = ORMDB(db)
+    user_ctx = payload.get("user_ctx", {})
+    plan = generate_plan(symptom_text=payload["symptom"], col=col, user_ctx=user_ctx)
+    items = enrich_with_price_inventory(db=orm, plan=plan["plan"], member_tier=payload.get("member_tier","basic"))
+    order_id = create_order(db=orm, member_id=payload.get("member_id",1), items=items)["order_id"]
+    order, order_items = orm.get_latest_order(payload.get("member_id",1))
+    return {"plan": plan, "items": order_items, "order": order}
+
+@app.get("/order/latest")
+def order_latest(member_id: int = Query(...), db: Session = Depends(get_db)):
+    orm = ORMDB(db)
+    order, items = orm.get_latest_order(member_id)
+    if order:
+        return {"order": {"order_id": order["id"], "total": order["total"], "payment_qr": f"/pay/{order['id']}"}, "items": items}
+    return {"order": None, "items": []}
+```
+### 前端路由与页面
+#### src/router.ts
+```ts
+import { createRouter, createWebHistory } from "vue-router";
+import Search from "./pages/Search.vue";
+import Symptom from "./pages/Symptom.vue";
+import Checkout from "./pages/Checkout.vue";
+
+export const router = createRouter({
+  history: createWebHistory(),
+  routes: [
+    { path: "/", component: Search },
+    { path: "/symptom", component: Symptom },
+    { path: "/checkout", component: Checkout }
+  ],
+});
+```
+#### src/pages/Search.vue
+```vue
+<template>
+  <div class="p-4">
+    <h2>药品检索</h2>
+    <input v-model="query" placeholder="输入药品名称或关键词" />
+    <button @click="search">搜索</button>
+    <div v-for="d in drugs" :key="d.drug_id">
+      <DrugCard :drug="d" />
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import axios from "axios";
+import { ref } from "vue";
+import DrugCard from "../components/DrugCard.vue";
+const query = ref(""); const drugs = ref<any[]>([]);
+async function search() {
+  const { data } = await axios.post("http://localhost:8000/drug/search", { query: query.value });
+  drugs.value = data;
+}
+</script>
+```
+#### src/pages/Symptom.vue
+```vue
+<template>
+  <div class="p-4">
+    <h2>症状解析</h2>
+    <textarea v-model="symptom" rows="4"></textarea>
+    <button @click="submit">生成用药清单</button>
+    <ExplainPanel v-if="resp" :plan="resp.plan" :items="resp.items" />
+  </div>
+</template>
+
+<script setup lang="ts">
+import axios from "axios";
+import { ref } from "vue";
+import ExplainPanel from "../components/ExplainPanel.vue";
+const symptom = ref(""); const resp = ref<any>(null);
+async function submit() {
+  const { data } = await axios.post("http://localhost:8000/symptom/plan", {
+    symptom: symptom.value,
+    user_ctx: { pregnant: false, prescription_uploaded: false, fever_celsius: 37.5 },
+    member_tier: "gold", member_id: 1
+  }); resp.value = data;
+}
+</script>
+```
+#### src/pages/Checkout.vue
+```vue
+<template>
+  <div class="p-4">
+    <h2>订单结算</h2>
+    <div v-if="order">
+      <p>订单号: {{ order.order_id }}</p>
+      <p>总金额: {{ order.total }} 元</p>
+      <p>支付二维码: <a :href="order.payment_qr" target="_blank">点击支付</a></p>
+    </div>
+    <div v-if="items.length">
+      <table border="1" cellpadding="8">
+        <thead><tr><th>药品ID</th><th>剂量</th><th>单价</th><th>折扣</th><th>最终价格</th></tr></thead>
+        <tbody>
+          <tr v-for="it in items" :key="it.drug_id">
+            <td>{{ it.drug_id }}</td><td>{{ it.dose }}</td>
+            <td>{{ it.unit_price }}</td><td>{{ it.discount_rate }}</td><td>{{ it.final_price }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div v-else><p>暂无订单，请先在症状解析页生成用药清单。</p></div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted } from "vue"; import axios from "axios";
+const order = ref<any>(null); const items = ref<any[]>([]);
+onMounted(async () => {
+  const { data } = await axios.get("http://localhost:8000/order/latest?member_id=1");
+  order.value = data.order; items.value = data.items;
+});
+</script>
+```
+### 基础设施与初始化
+#### infra/docker-compose.yml
+```yaml
+version: "3.9"
+services:
+  milvus:
+    image: milvusdb/milvus:2.4.6
+    container_name: milvus
+    ports: ["19530:19530", "9091:9091"]
+
+  postgres:
+    image: postgres:16
+    container_name: pharmacy-db
+    environment:
+      - POSTGRES_PASSWORD=pharmacy
+      - POSTGRES_USER=pharmacy
+      - POSTGRES_DB=pharmacy
+    ports: ["5432:5432"]
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/1_init.sql
+      - ./db/init_data.sql:/docker-entrypoint-initdb.d/2_init_data.sql
+
+  backend:
+    build: ../backend
+    container_name: pharmacy-api
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_BASE_URL=https://api.deepseek.com
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - DB_URL=postgresql+psycopg2://pharmacy:pharmacy@pharmacy-db:5432/pharmacy
+    depends_on: [milvus, postgres]
+    ports: ["8000:8000"]
+
+  frontend:
+    build: ../frontend
+    container_name: pharmacy-web
+    depends_on: [backend]
+    ports: ["5173:5173"]
+```
+#### infra/milvus/init_collection.py
+```python
+from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection
+connections.connect(host="milvus", port="19530")
+fields = [
+    FieldSchema(name="drug_id", dtype=DataType.INT64, is_primary=True, auto_id=False),
+    FieldSchema(name="name", dtype=DataType.VARCHAR, max_length=256),
+    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1536),
+    FieldSchema(name="metadata", dtype=DataType.JSON),
+]
+schema = CollectionSchema(fields, description="Drug vectors")
+col = Collection("drugs_vectors", schema)
+col.create_index(field_name="embedding", index_params={"index_type":"HNSW","metric_type":"COSINE","params":{"M":16,"efConstruction":200}})
+print("Milvus collection ready.")
+```
+#### infra/db/init.sql（建表）
+```sql
+-- 同前（drugs, inventory, prices, orders, order_items, audit_logs）
+-- 已在你之前的脚本中提供，这里保持一致
+```
+#### infra/db/init_data.sql（插入测试数据）
+```sql
+INSERT INTO drugs (id, name, generic_name, spec, manufacturer, is_rx, contraindications_json, flags_json)
+VALUES
+(1, '布洛芬片', 'Ibuprofen', '0.2g*24片', '某制药厂', FALSE, '["pregnancy"]', '["fever_high"]'),
+(2, '阿莫西林胶囊', 'Amoxicillin', '0.25g*20粒', '某制药厂', TRUE, '[]', '[]'),
+(3, '氯雷他定片', 'Loratadine', '10mg*10片', '某制药厂', FALSE, '[]', '[]');
+
+INSERT INTO inventory (drug_id, stock, batch_no, expire_date)
+VALUES
+(1, 200, 'B20250101', '2026-12-31'),
+(2, 150, 'A20250102', '2026-06-30'),
+(3, 300, 'C20250103', '2027-01-31');
+
+INSERT INTO prices (drug_id, list_price, member_tier, discount_rate)
+VALUES
+(1, 19.90, 'basic', 1.0), (1, 19.90, 'gold', 0.9),
+(2, 29.90, 'basic', 1.0), (2, 29.90, 'gold', 0.85),
+(3, 15.00, 'basic', 1.0), (3, 15.00, 'gold', 0.95);
+```
+#### backend/seeds/seed.py（Milvus 入库）
+```python
+import csv, json
+from pymilvus import connections, Collection
+from tools.drug_search import upsert_drug
+
+connections.connect(host="milvus", port="19530")
+col = Collection("drugs_vectors")
+
+with open("seeds/drugs.csv", encoding="utf-8") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        drug = {
+            "id": int(row["id"]),
+            "name": row["name"],
+            "indications": row.get("indications",""),
+            "contraindications": json.loads(row.get("contraindications","[]")),
+            "flags": json.loads(row.get("flags","[]")),
+            "is_rx": row.get("is_rx","false").lower()=="true",
+            "desc": row.get("desc","")
+        }
+        upsert_drug(col, drug)
+print("Seeded drugs into Milvus.")
+```
+### 前端 Dockerfile 与 package.json
+#### frontend/Dockerfile
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json .
+RUN npm install
+COPY . .
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+```
+#### frontend/package.json
+```json
+{
+  "name": "pharmacy-web",
+  "scripts": { "dev": "vite" },
+  "dependencies": { "vue": "^3.4.0", "axios": "^1.6.0", "vue-router": "^4.3.0" },
+  "devDependencies": { "vite": "^5.0.0", "@vitejs/plugin-vue": "^5.0.0" }
+}
+```
+### 一键启动与初始化
+#### Makefile
+```makefile
+up:
+  docker compose -f infra/docker-compose.yml up -d
+milvus-init:
+  docker exec -it milvus python /workspace/infra/milvus/init_collection.py
+seed:
+  docker exec -it pharmacy-api python /app/seeds/seed.py
+down:
+  docker compose -f infra/docker-compose.yml down
+```
+#### 启动步骤
+1. **配置密钥**：复制 `infra/.env.example` 为 `.env`，填入 `DEEPSEEK_API_KEY`。
+2. **启动容器**：`make up`
+3. **初始化 Milvus 集合**：`make milvus-init`
+4. **导入种子数据**：`make seed`
+5. **访问前端**：`http://localhost:5173`  
+   - `/`：药品检索  
+   - `/symptom`：症状解析（触发 Chat 推理链路）  
+   - `/checkout`：订单结算
+### 说明与后续
+- 已接通 **Embedding**（Milvus 入库与检索）与 **Chat**（症状→用药清单 JSON）。
+- Chat 返回非 JSON 时有回退策略，保证链路可用；正式环境建议加严格 JSON 模式与重试。
 
 ## 
