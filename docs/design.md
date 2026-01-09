@@ -2169,4 +2169,615 @@ if __name__ == "__main__":
 - 大模型自动补充药品信息，保证语义检索和规则引擎可用。
 - 可扩展：只需在 `drug_names` 列表中添加新药品名称即可。
 
+## 支付二维码链接
+要在订单生成环节增加 **支付二维码链接** 并给出 **具体应付款金额**，可以在 `order_checkout.py` 中扩展逻辑：  
+### 设计思路
+1. **计算应付款**  
+   - 遍历订单药品明细，累加 `final_price`。  
+   - 得到订单总金额。  
+2. **生成支付二维码链接**  
+   - 常见做法是生成一个支付 URL（例如 `/pay/{order_id}` 或第三方支付平台的链接）。  
+   - 前端可以用这个 URL 渲染二维码（如用 `qrcode.js` 或后端生成 base64 图片）。  
+3. **返回订单信息**  
+   - 包含订单号、应付款金额、支付二维码链接。  
+### 示例代码：`order_checkout.py`
+```python
+"""
+order_checkout.py
+负责生成订单并返回订单信息，包括支付二维码链接和应付款金额。
+"""
+from typing import List, Dict
+import urllib.parse
+
+def create_order(db, member_id: int, items: List[Dict]) -> Dict:
+    """
+    根据药品列表生成订单，并返回支付信息。
+
+    参数:
+        db: 数据库适配器，需实现 insert_order(member_id, items, total)
+        member_id: 用户 ID
+        items: 药品列表，每个元素包含 drug_id, final_price 等信息
+
+    返回:
+        dict: 包含订单号、总金额和支付二维码链接
+    """
+    # 1. 计算应付款金额
+    total = sum(i["final_price"] for i in items)
+
+    # 2. 插入订单到数据库
+    order_id = db.insert_order(member_id, items, total)
+
+    # 3. 构造支付链接（这里用一个示例 URL，可替换为真实支付网关）
+    pay_url = f"http://localhost:8000/pay?order_id={order_id}&amount={total}"
+    # 如果需要生成二维码，可以在前端用 pay_url 渲染二维码
+
+    return {
+        "order_id": order_id,
+        "total": round(total, 2),  # 保留两位小数
+        "payment_qr": pay_url
+    }
+```
+### 前端展示二维码
+在前端（Vue3）可以用 `qrcode` 库生成二维码：
+```vue
+<template>
+  <div>
+    <h3>应付款: {{ order.total }} 元</h3>
+    <div id="qrcode"></div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { onMounted } from "vue";
+import QRCode from "qrcode";
+
+const order = { order_id: 1001, total: 59.8, payment_qr: "http://localhost:8000/pay?order_id=1001&amount=59.8" };
+
+onMounted(() => {
+  QRCode.toCanvas(document.getElementById("qrcode"), order.payment_qr, { width: 200 });
+});
+</script>
+```
+### 总结
+- **后端**：在 `create_order` 中计算总金额并返回支付链接。  
+- **前端**：用支付链接生成二维码，展示应付款金额。  
+- **扩展**：支付链接可以对接支付宝、微信支付或 Stripe 等第三方网关，返回真实支付二维码。  
+
+## k8s部署配置
+来写一套 **部署在 Kubernetes 中的配置**，涵盖后端（FastAPI）、前端（Vue3）、数据库（Postgres）、向量库（Milvus）。这套配置可以直接放到 `k8s/` 目录下，使用 `kubectl apply -f` 部署。
+### 目录结构
+```text
+k8s/
+├─ backend-deployment.yaml
+├─ backend-service.yaml
+├─ frontend-deployment.yaml
+├─ frontend-service.yaml
+├─ postgres-statefulset.yaml
+├─ postgres-service.yaml
+├─ milvus-deployment.yaml
+├─ milvus-service.yaml
+├─ ingress.yaml
+```
+### **后端 (FastAPI)**
+#### backend-deployment.yaml
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pharmacy-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: pharmacy-backend
+  template:
+    metadata:
+      labels:
+        app: pharmacy-backend
+    spec:
+      containers:
+      - name: backend
+        image: your-registry/pharmacy-backend:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: DEEPSEEK_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: deepseek-secret
+              key: api-key
+        - name: DB_URL
+          value: postgresql+psycopg2://pharmacy:pharmacy@pharmacy-db:5432/pharmacy
+        - name: MILVUS_HOST
+          value: milvus
+        - name: MILVUS_PORT
+          value: "19530"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: deepseek-secret
+type: Opaque
+stringData:
+  api-key: "your_deepseek_api_key"
+```
+#### backend-service.yaml
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pharmacy-backend
+spec:
+  selector:
+    app: pharmacy-backend
+  ports:
+  - protocol: TCP
+    port: 8000
+    targetPort: 8000
+```
+### **前端 (Vue3)**
+#### frontend-deployment.yaml
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pharmacy-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: pharmacy-frontend
+  template:
+    metadata:
+      labels:
+        app: pharmacy-frontend
+    spec:
+      containers:
+      - name: frontend
+        image: your-registry/pharmacy-frontend:latest
+        ports:
+        - containerPort: 5173
+```
+#### frontend-service.yaml
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pharmacy-frontend
+spec:
+  selector:
+    app: pharmacy-frontend
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 5173
+  type: ClusterIP
+```
+### **Postgres 数据库**
+#### postgres-statefulset.yaml
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pharmacy-db
+spec:
+  serviceName: pharmacy-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pharmacy-db
+  template:
+    metadata:
+      labels:
+        app: pharmacy-db
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_USER
+          value: pharmacy
+        - name: POSTGRES_PASSWORD
+          value: pharmacy
+        - name: POSTGRES_DB
+          value: pharmacy
+        volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: pgdata
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 5Gi
+```
+#### postgres-service.yaml
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pharmacy-db
+spec:
+  selector:
+    app: pharmacy-db
+  ports:
+  - protocol: TCP
+    port: 5432
+    targetPort: 5432
+```
+### **Milvus 向量库**
+#### milvus-deployment.yaml
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: milvus
+  template:
+    metadata:
+      labels:
+        app: milvus
+    spec:
+      containers:
+      - name: milvus
+        image: milvusdb/milvus:2.4.6
+        ports:
+        - containerPort: 19530
+        - containerPort: 9091
+```
+#### milvus-service.yaml
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus
+spec:
+  selector:
+    app: milvus
+  ports:
+  - name: grpc
+    protocol: TCP
+    port: 19530
+    targetPort: 19530
+  - name: http
+    protocol: TCP
+    port: 9091
+    targetPort: 9091
+```
+### **Ingress 配置**
+#### ingress.yaml
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pharmacy-ingress
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+  - host: pharmacy.local
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: pharmacy-backend
+            port:
+              number: 8000
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: pharmacy-frontend
+            port:
+              number: 80
+```
+### 部署步骤
+1. 将以上 YAML 文件保存到 `k8s/` 目录。  
+2. 执行：
+   ```bash
+   kubectl apply -f k8s/
+   ```
+3. 确保集群中已安装 **Ingress Controller**（如 NGINX Ingress）。  
+4. 在本地 `/etc/hosts` 添加：
+   ```
+   127.0.0.1 pharmacy.local
+   ```
+5. 访问：
+   - `http://pharmacy.local/` → 前端 Vue3  
+   - `http://pharmacy.local/api` → 后端 FastAPI  
+
+这样你就能在 Kubernetes 中完整部署前端、后端、数据库和 Milvus。  
+
+## helm chart部署
+来把之前的 K8s YAML 打包成一个 **Helm Chart**，这样你可以通过参数化配置快速部署和升级。  
+### 目录结构
+```text
+helm/pharmacy/
+├─ Chart.yaml
+├─ values.yaml
+├─ templates/
+│  ├─ backend-deployment.yaml
+│  ├─ backend-service.yaml
+│  ├─ frontend-deployment.yaml
+│  ├─ frontend-service.yaml
+│  ├─ postgres-statefulset.yaml
+│  ├─ postgres-service.yaml
+│  ├─ milvus-deployment.yaml
+│  ├─ milvus-service.yaml
+│  └─ ingress.yaml
+```
+### Chart.yaml
+```yaml
+apiVersion: v2
+name: pharmacy
+description: 智能售药平台 Helm Chart
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+```
+### values.yaml
+```yaml
+replicaCount: 2
+
+image:
+  backend: your-registry/pharmacy-backend:latest
+  frontend: your-registry/pharmacy-frontend:latest
+  postgres: postgres:16
+  milvus: milvusdb/milvus:2.4.6
+
+service:
+  backendPort: 8000
+  frontendPort: 80
+  postgresPort: 5432
+  milvusGrpcPort: 19530
+  milvusHttpPort: 9091
+
+postgres:
+  user: pharmacy
+  password: pharmacy
+  database: pharmacy
+  storage: 5Gi
+
+ingress:
+  enabled: true
+  className: nginx
+  host: pharmacy.local
+```
+### templates/backend-deployment.yaml
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-backend
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-backend
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-backend
+    spec:
+      containers:
+      - name: backend
+        image: {{ .Values.image.backend }}
+        ports:
+        - containerPort: {{ .Values.service.backendPort }}
+        env:
+        - name: DEEPSEEK_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: deepseek-secret
+              key: api-key
+        - name: DB_URL
+          value: postgresql+psycopg2://{{ .Values.postgres.user }}:{{ .Values.postgres.password }}@{{ .Release.Name }}-db:{{ .Values.service.postgresPort }}/{{ .Values.postgres.database }}
+        - name: MILVUS_HOST
+          value: {{ .Release.Name }}-milvus
+        - name: MILVUS_PORT
+          value: "{{ .Values.service.milvusGrpcPort }}"
+```
+### templates/backend-service.yaml
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-backend
+spec:
+  selector:
+    app: {{ .Release.Name }}-backend
+  ports:
+  - protocol: TCP
+    port: {{ .Values.service.backendPort }}
+    targetPort: {{ .Values.service.backendPort }}
+```
+### templates/frontend-deployment.yaml
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-frontend
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-frontend
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-frontend
+    spec:
+      containers:
+      - name: frontend
+        image: {{ .Values.image.frontend }}
+        ports:
+        - containerPort: 5173
+```
+### templates/frontend-service.yaml
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-frontend
+spec:
+  selector:
+    app: {{ .Release.Name }}-frontend
+  ports:
+  - protocol: TCP
+    port: {{ .Values.service.frontendPort }}
+    targetPort: 5173
+```
+### templates/postgres-statefulset.yaml
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-db
+spec:
+  serviceName: {{ .Release.Name }}-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-db
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-db
+    spec:
+      containers:
+      - name: postgres
+        image: {{ .Values.image.postgres }}
+        ports:
+        - containerPort: {{ .Values.service.postgresPort }}
+        env:
+        - name: POSTGRES_USER
+          value: {{ .Values.postgres.user }}
+        - name: POSTGRES_PASSWORD
+          value: {{ .Values.postgres.password }}
+        - name: POSTGRES_DB
+          value: {{ .Values.postgres.database }}
+        volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: pgdata
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: {{ .Values.postgres.storage }}
+```
+### templates/postgres-service.yaml
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-db
+spec:
+  selector:
+    app: {{ .Release.Name }}-db
+  ports:
+  - protocol: TCP
+    port: {{ .Values.service.postgresPort }}
+    targetPort: {{ .Values.service.postgresPort }}
+```
+### templates/milvus-deployment.yaml
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-milvus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-milvus
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-milvus
+    spec:
+      containers:
+      - name: milvus
+        image: {{ .Values.image.milvus }}
+        ports:
+        - containerPort: {{ .Values.service.milvusGrpcPort }}
+        - containerPort: {{ .Values.service.milvusHttpPort }}
+```
+### templates/milvus-service.yaml
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-milvus
+spec:
+  selector:
+    app: {{ .Release.Name }}-milvus
+  ports:
+  - name: grpc
+    protocol: TCP
+    port: {{ .Values.service.milvusGrpcPort }}
+    targetPort: {{ .Values.service.milvusGrpcPort }}
+  - name: http
+    protocol: TCP
+    port: {{ .Values.service.milvusHttpPort }}
+    targetPort: {{ .Values.service.milvusHttpPort }}
+```
+### templates/ingress.yaml
+```yaml
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}-ingress
+  annotations:
+    kubernetes.io/ingress.class: {{ .Values.ingress.className }}
+spec:
+  rules:
+  - host: {{ .Values.ingress.host }}
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ .Release.Name }}-backend
+            port:
+              number: {{ .Values.service.backendPort }}
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ .Release.Name }}-frontend
+            port:
+              number: {{ .Values.service.frontendPort }}
+{{- end }}
+```
+### 部署步骤
+1. 打包 Chart：
+   ```bash
+   helm package helm/pharmacy
+   ```
+2. 安装：
+   ```bash
+   helm install pharmacy ./pharmacy-0.1.0.tgz
+   ```
+3. 升级：
+   ```bash
+   helm upgrade pharmacy ./pharmacy-0.1.0.tgz
+   ```
+
+这样，你就有了一个完整的 **Helm Chart**，可以通过修改 `values.yaml` 来调整镜像、端口、数据库配置和 Ingress。  
+
 ## 
