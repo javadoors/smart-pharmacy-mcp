@@ -234,7 +234,7 @@ def create_order(db, member_id: int, items: list):
 #### FastAPI 路由（示例）
 ```python
 # app.py
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Query
 from config import init_milvus
 from tools.symptom_to_plan import generate_plan
 from tools.pricing_inventory import enrich_with_price_inventory
@@ -243,13 +243,49 @@ from tools.order_checkout import create_order
 app = FastAPI()
 col = init_milvus()
 
+# 伪 DB 适配器（示例）
+class DB:
+    def __init__(self):
+        # 用内存模拟订单存储
+        self.orders = []
+        self.items = {}
+
+    def get_inventory(self, drug_id): 
+        return {"stock": 100}
+
+    def get_price(self, drug_id, tier): 
+        return {"list_price": 39.9, "discount_rate": 0.9 if tier=="gold" else 1.0}
+
+    def insert_order(self, member_id, items, total):
+        order_id = len(self.orders) + 1
+        self.orders.append({"id": order_id, "member_id": member_id, "total": total})
+        self.items[order_id] = items
+        return order_id
+
+    def get_latest_order(self, member_id):
+        # 找到该用户最新订单
+        for order in reversed(self.orders):
+            if order["member_id"] == member_id:
+                return order, self.items.get(order["id"], [])
+        return None, []
+
+db = DB()
+
 @app.post("/symptom/plan")
-def symptom_plan(payload: dict, user=Depends(...)):
+def symptom_plan(payload: dict):
     user_ctx = payload.get("user_ctx", {})
-    plan = generate_plan(deepseek_client=None, symptom_text=payload["symptom"], col=col, user_ctx=user_ctx)
-    items = enrich_with_price_inventory(db=..., plan=plan["plan"], member_tier=user["tier"])
-    order = create_order(db=..., member_id=user["id"], items=items)
-    return {"plan": plan, "items": items, "order": order}
+    plan = generate_plan(symptom_text=payload["symptom"], col=col, user_ctx=user_ctx)
+    items = enrich_with_price_inventory(db=db, plan=plan["plan"], member_tier=payload.get("member_tier","basic"))
+    order_id = create_order(db=db, member_id=payload.get("member_id",1), items=items)["order_id"]
+    order, order_items = db.get_latest_order(payload.get("member_id",1))
+    return {"plan": plan, "items": order_items, "order": order}
+
+@app.get("/order/latest")
+def order_latest(member_id: int = Query(...)):
+    order, items = db.get_latest_order(member_id)
+    if order:
+        return {"order": {"order_id": order["id"], "total": order["total"], "payment_qr": f"/pay/{order['id']}"}, "items": items}
+    return {"order": None, "items": []}
 ```
 ### 前端（Vue3）页面与交互
 #### 页面
@@ -784,6 +820,259 @@ down:
 - **药师复核页**：在前端增加复核工作流与覆盖决策能力。
 - **召回评估**：定期评估 Milvus Top-K 命中率与用户反馈，优化文本清洗与索引参数。
 - **云上托管**：如需云上托管与一体化工作流，可参考云厂商的 Milvus+LangChain+DeepSeek RAG 方案文章进行扩展。 
+
+## 接通DeepSeek Embedding API/前端拆分成路由结构
+把之前的骨架扩成一个 **可直接初始化的 Git 仓库模板**，并且先接通 **DeepSeek Embedding API**，前端也拆分成路由结构，方便后续扩展。
+### 仓库结构
+```text
+smart-pharmacy/
+├─ backend/
+│  ├─ app.py
+│  ├─ config.py
+│  ├─ domain/
+│  │  ├─ models.py
+│  │  └─ schemas.py
+│  ├─ tools/
+│  │  ├─ drug_search.py
+│  │  ├─ rule_engine.py
+│  │  ├─ symptom_to_plan.py
+│  │  ├─ pricing_inventory.py
+│  │  └─ order_checkout.py
+│  ├─ seeds/
+│  │  ├─ drugs.csv
+│  │  └─ seed.py
+│  ├─ requirements.txt
+│  └─ Dockerfile
+├─ frontend/
+│  ├─ src/
+│  │  ├─ main.ts
+│  │  ├─ router.ts
+│  │  ├─ App.vue
+│  │  ├─ pages/
+│  │  │  ├─ Search.vue
+│  │  │  ├─ Symptom.vue
+│  │  │  └─ Checkout.vue
+│  │  └─ components/
+│  │     ├─ DrugCard.vue
+│  │     ├─ RuleBadge.vue
+│  │     └─ ExplainPanel.vue
+│  ├─ package.json
+│  └─ Dockerfile
+├─ infra/
+│  ├─ docker-compose.yml
+│  ├─ milvus/init_collection.py
+│  ├─ db/init.sql
+│  └─ .env.example
+└─ README.md
+```
+### 接通 DeepSeek Embedding API
+DeepSeek 提供 **OpenAI 风格 API**，所以可以直接用 `requests` 或 `openai` SDK 兼容调用。
+#### backend/tools/drug_search.py
+```python
+import os
+import requests
+from typing import List, Dict
+from pymilvus import Collection
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+def embed_text(text: str) -> List[float]:
+    url = "https://api.deepseek.com/v1/embeddings"
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}"}
+    payload = {
+        "model": "deepseek-embedding",  # DeepSeek 提供的 embedding 模型名称
+        "input": text
+    }
+    resp = requests.post(url, headers=headers, json=payload)
+    resp.raise_for_status()
+    return resp.json()["data"][0]["embedding"]
+
+def upsert_drug(col: Collection, drug: Dict):
+    vec = embed_text(
+        f"{drug['name']} {drug.get('indications','')} {drug.get('contraindications','')} {drug.get('desc','')}"
+    )
+    col.insert([[drug["id"]], [drug["name"]], [vec], [drug]])
+
+def search_drugs(col: Collection, query: str, top_k: int = 10) -> List[Dict]:
+    qvec = embed_text(query)
+    res = col.search([qvec], "embedding", params={"metric_type":"COSINE"}, limit=top_k,
+                     output_fields=["drug_id","name","metadata"])
+    out = []
+    for hits in res:
+        for r in hits:
+            out.append({
+                "drug_id": r.id,
+                "name": r.entity.get("name"),
+                "meta": r.entity.get("metadata")
+            })
+    return out
+```
+### 前端路由拆分
+#### frontend/src/router.ts
+```ts
+import { createRouter, createWebHistory } from "vue-router";
+import Search from "./pages/Search.vue";
+import Symptom from "./pages/Symptom.vue";
+import Checkout from "./pages/Checkout.vue";
+
+const routes = [
+  { path: "/", component: Search },
+  { path: "/symptom", component: Symptom },
+  { path: "/checkout", component: Checkout }
+];
+
+export const router = createRouter({
+  history: createWebHistory(),
+  routes,
+});
+```
+#### frontend/src/main.ts
+```ts
+import { createApp } from "vue";
+import App from "./App.vue";
+import { router } from "./router";
+
+createApp(App).use(router).mount("#app");
+```
+### 前端页面示例
+#### Search.vue
+```vue
+<template>
+  <div>
+    <h2>药品检索</h2>
+    <input v-model="query" placeholder="输入药品名称或关键词" />
+    <button @click="search">搜索</button>
+    <div v-for="d in drugs" :key="d.drug_id">
+      <DrugCard :drug="d" />
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import axios from "axios";
+import { ref } from "vue";
+import DrugCard from "../components/DrugCard.vue";
+
+const query = ref("");
+const drugs = ref<any[]>([]);
+
+async function search() {
+  const { data } = await axios.post("http://localhost:8000/drug/search", { query: query.value });
+  drugs.value = data;
+}
+</script>
+```
+#### Symptom.vue
+```vue
+<template>
+  <div>
+    <h2>症状解析</h2>
+    <textarea v-model="symptom" rows="4"></textarea>
+    <button @click="submit">生成用药清单</button>
+    <ExplainPanel v-if="resp" :plan="resp.plan" :items="resp.items" />
+  </div>
+</template>
+
+<script setup lang="ts">
+import axios from "axios";
+import { ref } from "vue";
+import ExplainPanel from "../components/ExplainPanel.vue";
+
+const symptom = ref("");
+const resp = ref<any>(null);
+
+async function submit() {
+  const { data } = await axios.post("http://localhost:8000/symptom/plan", {
+    symptom: symptom.value,
+    user_ctx: { pregnant: false, prescription_uploaded: false, fever_celsius: 37.5 },
+    member_tier: "gold",
+    member_id: 1
+  });
+  resp.value = data;
+}
+</script>
+```
+#### Checkout.vue
+```vue
+<template>
+  <div class="p-4">
+    <h2>订单结算</h2>
+
+    <div v-if="order">
+      <h3>订单信息</h3>
+      <p>订单号: {{ order.order_id }}</p>
+      <p>总金额: {{ order.total }} 元</p>
+      <p>支付二维码: <a :href="order.payment_qr" target="_blank">点击支付</a></p>
+    </div>
+
+    <div v-if="items.length">
+      <h3>订单明细</h3>
+      <table border="1" cellpadding="8">
+        <thead>
+          <tr>
+            <th>药品ID</th>
+            <th>剂量</th>
+            <th>单价</th>
+            <th>折扣</th>
+            <th>最终价格</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="it in items" :key="it.drug_id">
+            <td>{{ it.drug_id }}</td>
+            <td>{{ it.dose }}</td>
+            <td>{{ it.unit_price }}</td>
+            <td>{{ it.discount_rate }}</td>
+            <td>{{ it.final_price }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div v-if="!order">
+      <p>暂无订单，请先在症状解析页生成用药清单。</p>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted } from "vue";
+import axios from "axios";
+
+const order = ref<any>(null);
+const items = ref<any[]>([]);
+
+onMounted(async () => {
+  // 假设后端提供 /order/latest 接口获取最近订单
+  const { data } = await axios.get("http://localhost:8000/order/latest?member_id=1");
+  order.value = data.order;
+  items.value = data.items;
+});
+</script>
+```
+#### App.vue
+```vue
+<template>
+  <div>
+    <nav>
+      <router-link to="/">药品检索</router-link> |
+      <router-link to="/symptom">症状解析</router-link> |
+      <router-link to="/checkout">订单结算</router-link>
+    </nav>
+    <router-view />
+  </div>
+</template>
+
+<script setup lang="ts">
+</script>
+```
+### 下一步建议
+1. **Embedding 已接通**：你现在可以用真实 DeepSeek API 把药品信息写入 Milvus。
+2. **前端路由已拆分**：可以在 `/` 做药品检索，在 `/symptom` 做症状解析，在 `/checkout` 做订单结算。
+3. **后续扩展**：
+   - 在 `drug_search` 增加 `/drug/search` API 路由。
+   - 在 `symptom_to_plan` 增加调用 DeepSeek Chat，生成用药说明。
+   - 在前端 Checkout.vue 展示订单与支付。
 
 ## 功能列表
 - 症状解析工具：输入症状文本 → 输出结构化症状、红旗标记。

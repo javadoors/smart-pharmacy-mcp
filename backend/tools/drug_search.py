@@ -1,11 +1,20 @@
+import os
+import requests
 from typing import List, Dict
 from pymilvus import Collection
-import numpy as np
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 def embed_text(text: str) -> List[float]:
-    # 这里可替换为 DeepSeek Embedding（OpenAI风格 API）
-    # 参考 Milvus 文档中的 DeepSeek 集成说明。 
-    return np.random.rand(1536).tolist()
+    url = "https://api.deepseek.com/v1/embeddings"
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}"}
+    payload = {
+        "model": "deepseek-embedding",  # DeepSeek 提供的 embedding 模型名称
+        "input": text
+    }
+    resp = requests.post(url, headers=headers, json=payload)
+    resp.raise_for_status()
+    return resp.json()["data"][0]["embedding"]
 
 def upsert_drug(col: Collection, drug: Dict):
     vec = embed_text(
