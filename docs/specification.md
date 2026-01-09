@@ -85,20 +85,20 @@
 flowchart TD
 
     subgraph Frontend["前端Vue3"]
-        A1[Search 页面]
-        A2[Symptom 页面]
-        A3[Checkout 页面]
+        A1[Search页面]
+        A2[Symptom页面]
+        A3[Checkout页面]
     end
 
     subgraph Backend["后端:FastAPI+LangChain"]
-        B1[药品检索工具\n(Milvus + Embedding)]
+        B1[药品检索工具\nMilvus+Embedding]
         B2[规则引擎工具\n(禁忌/处方/红旗)]
-        B3[症状解析工具\n\(Chat 推理链路\)]
+        B3[症状解析工具\nChat推理链路]
         B4[订单与支付\n库存/价格/折扣/二维码]
         B5[模拟支付接口/pay]
     end
 
-    subgraph DB["数据库(Postgres)"]
+    subgraph DB["数据库Postgres"]
         C1[药品表]
         C2[库存表]
         C3[价格表]
@@ -106,11 +106,11 @@ flowchart TD
         C5[审计日志]
     end
 
-    subgraph VectorDB["向量库(Milvus)"]
+    subgraph VectorDB["向量库Milvus"]
         D1[药品向量集合]
     end
 
-    subgraph LLM["大模型(DeepSeek)"]
+    subgraph LLM["大模型DeepSeek"]
         E1[Embedding API]
         E2[Chat API]
     end
@@ -208,7 +208,7 @@ flowchart TD
     FE --> API[后端 FastAPI/symptom/plan]
 
     subgraph Backend["后端服务链路"]
-        API --> DS[药品检索工具\n(Milvus+Embedding)]
+        API --> DS[药品检索工具\nMilvus+Embedding]
         DS --> RE[规则引擎工具\n禁忌/处方/红旗]
         RE --> CHAT[症状解析工具\nDeepSeek Chat推理]
         CHAT --> PLAN[生成用药清单(JSON)]
@@ -218,7 +218,7 @@ flowchart TD
         PAY --> SIM[模拟支付接口/pay]
     end
 
-    subgraph DB["Postgres 数据库"]
+    subgraph DB["Postgres数据库"]
         PI --> INV[库存表]
         PI --> PRC[价格表]
         ORD --> ODR[订单表]
@@ -229,12 +229,12 @@ flowchart TD
         DS --> VEC[药品向量集合]
     end
 
-    subgraph LLM["大模型 DeepSeek"]
+    subgraph LLM["大模型DeepSeek"]
         DS --> EMB[Embedding API]
         CHAT --> CHATAPI[Chat API]
     end
 
-    SIM --> FEOUT[前端 Checkout 页面]
+    SIM --> FEOUT[前端Checkout页面]
     FEOUT --> UOUT[用户查看订单与支付结果]
 ```
 ### **说明**
