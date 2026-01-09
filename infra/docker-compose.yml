@@ -1,0 +1,41 @@
+version: "3.9"
+services:
+  milvus:
+    image: milvusdb/milvus:2.4.6
+    container_name: milvus
+    ports: ["19530:19530", "9091:9091"]
+    environment:
+      - MILVUS_LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "19530"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  postgres:
+    image: postgres:16
+    container_name: pharmacy-db
+    environment:
+      - POSTGRES_PASSWORD=pharmacy
+      - POSTGRES_USER=pharmacy
+      - POSTGRES_DB=pharmacy
+    ports: ["5432:5432"]
+    volumes:
+      - ./infra/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  backend:
+    build: ./backend
+    container_name: pharmacy-api
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - DB_URL=postgresql://pharmacy:pharmacy@pharmacy-db:5432/pharmacy
+    depends_on: [milvus, postgres]
+    ports: ["8000:8000"]
+
+  frontend:
+    build: ./frontend
+    container_name: pharmacy-web
+    depends_on: [backend]
+    ports: ["5173:5173"]
