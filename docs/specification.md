@@ -92,7 +92,7 @@ flowchart TD
 
     subgraph Backend["后端:FastAPI+LangChain"]
         B1[药品检索工具\nMilvus+Embedding]
-        B2[规则引擎工具\n(禁忌/处方/红旗)]
+        B2[规则引擎工具\n禁忌/处方/红旗]
         B3[症状解析工具\nChat推理链路]
         B4[订单与支付\n库存/价格/折扣/二维码]
         B5[模拟支付接口/pay]
@@ -211,7 +211,7 @@ flowchart TD
         API --> DS[药品检索工具\nMilvus+Embedding]
         DS --> RE[规则引擎工具\n禁忌/处方/红旗]
         RE --> CHAT[症状解析工具\nDeepSeek Chat推理]
-        CHAT --> PLAN[生成用药清单(JSON)]
+        CHAT --> PLAN[生成用药清单JSON]
         PLAN --> PI[库存与价格查询\nSQLAlchemy ORM]
         PI --> ORD[订单生成\n计算应付款金额]
         ORD --> PAY[支付二维码链接]
